@@ -4,6 +4,51 @@
 
 ---
 
+## Pass 总表
+
+### 默认管线 Pass
+
+| # | Pass 名称 | 粒度 | 阶段 | 功能 | CLI 控制 | 实现文件 |
+|---|---|---|---|---|---|---|
+| 1 | **PTOAssignDefaultFrontendPipeId** | FuncOp | 前端规范化 | 为省略 `id` 的前端管道操作补上默认 `id=0` | 始终执行 | `PTOAssignDefaultFrontendPipeIdPass.cpp` |
+| 2 | **PTOLowerFrontendPipeOps** | FuncOp | 前端规范化 | 将前端管道 op（`aic_initialize_pipe`、`tpush_to_aiv` 等）降级为内部统一管道 IR（`initialize_l2l_pipe`、`tpush`、`tpop` 等） | 始终执行 | `PTOLowerFrontendPipeOpsPass.cpp` |
+| 3 | **PTOInferValidatePipeInit** | ModuleOp | 前端规范化 | 推断和校验内部管道 `nosplit` 配置，传播到管道对端 | 始终执行 | `PTOInferValidatePipeInitPass.cpp` |
+| 4 | **LoweringSyncToPipe** | FuncOp | 同步/布局 | 将 `record_event` / `wait_event` 降级为 `set_flag` / `wait_flag`，SyncOpType → PIPE 枚举映射 | 始终执行 | `LoweringSyncToPipe.cpp` |
+| 5 | **InferPTOLayout** | FuncOp | 同步/布局 | 为 `make_tensor_view` 推断全局张量布局（ND/DN/NZ） | `--disable-infer-layout` 关闭 | `InferPTOLayout.cpp` |
+| 6 | **PTOA5NormalizeTMov** | FuncOp | 同步/布局 | 规范化 A5 上不安全的 vec→vec col_major TMOV 为 row_major 路径 | 始终执行 | `PTOA5NormalizeTMovPass.cpp` |
+| 7 | **PTOViewToMemref** | ModuleOp | 内存规划 | 将 TileBufType / TensorView 转为 memref，通过 `bind_tile` 保留 tile 元数据 | 始终执行 | `PTOViewToMemref.cpp` |
+| 8 | **PlanMemory** | ModuleOp | 内存规划 | 为所有 tile 缓冲区规划物理内存地址，生命周期不重叠的 tile 复用内存 | `--pto-level=level3` 跳过 | `PTOPlanMemory.cpp` |
+| 9 | **PTOResolveReservedBuffers** | ModuleOp | 内存规划 | 解析 `reserve_buffer` / `import_reserved_buffer` 为常量地址，对齐管道 `flag_base` | 始终执行 | `PTOResolveReservedBuffersPass.cpp` |
+| 10a | **InsertSync** | FuncOp | 同步插入 | 分析内存依赖，在管道间插入最小 `set_flag` / `wait_flag` | `--enable-insert-sync` | `InsertSync/`（10 文件） |
+| 10b | **InjectBarrierAllSync** | FuncOp | 同步插入 | 在每个有内存副作用的管道操作前插入 `barrier <PIPE_ALL>` | `--enable-inject-barrier-all-sync` | `PTOInjectBarrierAllSync.cpp` |
+| 10c | **GraphSyncSolver** | FuncOp | 同步插入 | 构建冲突图，Dijkstra 求解 + 图着色分配事件 ID，生成优化同步方案 | `--enable-graph-sync-solver` | `GraphSyncSolver/`（8 文件） |
+| 11 | **PTOMaterializeTileHandles** | ModuleOp | 代码生成 | 将内存规划后的 memref 重新包装为 `materialize_tile`，恢复 tile 句柄供 EmitC 使用 | 始终执行 | `PTOMaterializeTileHandles.cpp` |
+| 12 | **CSE** | — | 代码生成 | 公共子表达式消除，清理 MaterializeTileHandles 的冗余 | 始终执行 | MLIR 内置 |
+| 13 | **PTOToEmitC** | ModuleOp | 代码生成 | 202 个 PTO op → `emitc::CallOpaqueOp`，TileBufType → C++ Tile 模板 | `--pto-arch=a3/a5` | `PTOToEmitC.cpp`（11890 行） |
+| 14 | **FormExpressions + CSE** | — | 代码生成 | 将分散的 EmitC 操作合并为 C++ 表达式树，消除冗余 | 始终执行 | MLIR 内置 |
+
+### 非管线 Pass
+
+| Pass 名称 | 粒度 | 功能 | 状态 |
+|---|---|---|---|
+| **PTOVerifyTFree** | FuncOp | 校验 `tpop` / `tfree` 配对正确性 | 默认管线中注释掉 |
+| **PTOWrapFunctionsInSections** | FuncOp | 将 `kernel_kind=cube/vector` 的函数体包裹在 `section.cube/vector` 中 | 按需使用 |
+| **ConvertToPTOOp** | — | 将其他方言操作转换为 PTO 操作 | 按需使用 |
+| **InferPTOMemScope** | — | 推断和传播 PTO 操作的内存作用域信息 | 按需使用 |
+| **PTORemoveRedundantBarrier** | — | 移除冗余 barrier 操作 | 按需使用 |
+| **AllocToPointerCast** | — | 将 alloc 转换为 pointer_cast | 内部使用 |
+| **OptMemPlanForPipeline** | — | 针对流水线场景的内存规划优化 | 内部使用 |
+
+### 后处理（非 Pass）
+
+| 步骤 | 功能 |
+|---|---|
+| `dropEmptyEmitCExpressions` | 清除 FormExpressions 产生的空节点 |
+| `materializeControlFlowOperands` | 确保 scf 控制流操作数正确嵌入 EmitC |
+| `reorderEmitCFunctions` | 按 C++ 编译依赖重排输出函数（被调用者在前） |
+
+---
+
 ## 管线总览
 
 ```
